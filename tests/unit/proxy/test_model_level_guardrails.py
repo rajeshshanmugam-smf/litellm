@@ -18,6 +18,7 @@ from litellm.proxy.utils import (
     check_and_merge_model_level_guardrails,
     _merge_guardrails_with_existing,
 )
+from tests.unit.proxy.router_entry_point_stubs import route_entry_points_to_stubs
 
 # ---------------------------------------------------------------------------
 # Unit tests for _check_and_merge_model_level_guardrails
@@ -33,7 +34,7 @@ class TestCheckAndMergeModelLevelGuardrails:
             "model": "gpt-4",
             "metadata": {"model_info": {"id": "model-uuid-123"}},
         }
-        mock_router = MagicMock()
+        mock_router = route_entry_points_to_stubs(MagicMock())
         mock_deployment = MagicMock()
         mock_deployment.litellm_params.get.return_value = ["openai-moderation"]
         mock_router.get_deployment.return_value = mock_deployment
@@ -52,7 +53,7 @@ class TestCheckAndMergeModelLevelGuardrails:
                 "guardrails": ["existing-guardrail"],
             },
         }
-        mock_router = MagicMock()
+        mock_router = route_entry_points_to_stubs(MagicMock())
         mock_deployment = MagicMock()
         mock_deployment.litellm_params.get.return_value = ["model-guardrail"]
         mock_router.get_deployment.return_value = mock_deployment
@@ -71,7 +72,7 @@ class TestCheckAndMergeModelLevelGuardrails:
                 "guardrails": ["openai-moderation"],
             },
         }
-        mock_router = MagicMock()
+        mock_router = route_entry_points_to_stubs(MagicMock())
         mock_deployment = MagicMock()
         mock_deployment.litellm_params.get.return_value = ["openai-moderation"]
         mock_router.get_deployment.return_value = mock_deployment
@@ -90,7 +91,7 @@ class TestCheckAndMergeModelLevelGuardrails:
         """Returns data unchanged when metadata has no model_info AND the
         model alias does not resolve to a deployment."""
         data = {"model": "gpt-4", "metadata": {}}
-        mock_router = MagicMock()
+        mock_router = route_entry_points_to_stubs(MagicMock())
         # Neither the model_id lookup nor the alias-fallback lookup
         # finds a deployment.
         mock_router.get_deployment.return_value = None
@@ -104,7 +105,7 @@ class TestCheckAndMergeModelLevelGuardrails:
             "model": "gpt-4",
             "metadata": {"model_info": {"id": "model-uuid-123"}},
         }
-        mock_router = MagicMock()
+        mock_router = route_entry_points_to_stubs(MagicMock())
         mock_deployment = MagicMock()
         mock_deployment.litellm_params.get.return_value = None
         mock_router.get_deployment.return_value = mock_deployment
@@ -119,7 +120,7 @@ class TestCheckAndMergeModelLevelGuardrails:
             "model": "gpt-4",
             "metadata": {"model_info": {"id": "nonexistent-id"}},
         }
-        mock_router = MagicMock()
+        mock_router = route_entry_points_to_stubs(MagicMock())
         mock_router.get_deployment.return_value = None
 
         result = check_and_merge_model_level_guardrails(data=data, llm_router=mock_router)
@@ -135,7 +136,7 @@ class TestCheckAndMergeModelLevelGuardrails:
                 "guardrails": ["existing"],
             },
         }
-        mock_router = MagicMock()
+        mock_router = route_entry_points_to_stubs(MagicMock())
         mock_deployment = MagicMock()
         mock_deployment.litellm_params.get.return_value = ["new-guardrail"]
         mock_router.get_deployment.return_value = mock_deployment
@@ -208,6 +209,7 @@ async def test_pre_call_hook_runs_once_with_model_level_guardrails():
         await guardrail.async_pre_call_deployment_hook(data, CallTypes.acompletion)
 
     assert guardrail.pre_call_count == 1
+    assert "litellm_metadata" not in data
 
 
 @pytest.mark.asyncio
@@ -300,6 +302,88 @@ async def test_deployment_hook_runs_pre_call_without_proxy_loop():
     assert guardrail.pre_call_count == 1
 
 
+@pytest.mark.asyncio
+async def test_messages_user_id_metadata_runs_pre_call_guardrail_once():
+    """
+    Anthropic metadata.user_id sits beside litellm_metadata that already records
+    another guardrail. After this guardrail records that it ran,
+    translate_anthropic_to_openai keeps the masked text, the user id, and the
+    other guardrail's marker, and neither deployment hook scans again.
+    """
+    from litellm.constants import PRE_CALL_EXECUTED_GUARDRAILS_KEY
+    from litellm.integrations.custom_guardrail import CustomGuardrail
+    from litellm.llms.anthropic.messages.adapters.transformation import (
+        LiteLLMAnthropicMessagesAdapter,
+    )
+    from litellm.proxy._types import CallTypes
+    from litellm.types.guardrails import GuardrailEventHooks
+
+    class MaskingGuardrail(CustomGuardrail):
+        def __init__(self):
+            super().__init__(
+                guardrail_name="masking-guardrail",
+                event_hook=GuardrailEventHooks.pre_call,
+                default_on=True,
+            )
+            self.pre_call_count = 0
+
+        async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+            self.pre_call_count += 1
+            for message in data["messages"]:
+                content = message.get("content")
+                if isinstance(content, str):
+                    message["content"] = content.replace("raw-pii-token", "masked-pii-token")
+            return data
+
+    class PriorGuardrail(CustomGuardrail):
+        def __init__(self):
+            super().__init__(
+                guardrail_name="prior-guardrail",
+                event_hook=GuardrailEventHooks.pre_call,
+                default_on=True,
+            )
+            self.pre_call_count = 0
+
+        async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+            self.pre_call_count += 1
+            return data
+
+    prior = PriorGuardrail()
+    prior_metadata: dict[str, object] = {}
+    prior.mark_pre_call_hook_ran({"litellm_metadata": prior_metadata})
+    prior_executed = prior_metadata[PRE_CALL_EXECUTED_GUARDRAILS_KEY]
+    assert isinstance(prior_executed, list) and prior_executed
+    prior_marker = prior_executed[0]
+
+    guardrail = MaskingGuardrail()
+    data = {
+        "model": "gpt-4o",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "repeat raw-pii-token"}],
+        "metadata": {"user_id": "test-user"},
+        "litellm_metadata": {PRE_CALL_EXECUTED_GUARDRAILS_KEY: [prior_marker]},
+    }
+
+    await guardrail.async_pre_call_hook(None, None, data, "anthropic_messages")
+    guardrail.mark_pre_call_hook_ran(data)
+    translated = LiteLLMAnthropicMessagesAdapter().translate_anthropic_to_openai(
+        anthropic_message_request=data,
+    )[0]
+    translated["guardrails"] = ["prior-guardrail", "masking-guardrail"]
+    await prior.async_pre_call_deployment_hook(translated, CallTypes.acompletion)
+    await guardrail.async_pre_call_deployment_hook(translated, CallTypes.acompletion)
+
+    surviving = translated["metadata"][PRE_CALL_EXECUTED_GUARDRAILS_KEY]
+    content = translated["messages"][0]["content"]
+    assert isinstance(surviving, list)
+    assert prior_marker in surviving
+    assert any(isinstance(item, str) and item.endswith(":masking-guardrail") for item in surviving)
+    assert prior.pre_call_count == 0
+    assert guardrail.pre_call_count == 1
+    assert content == "repeat masked-pii-token"
+    assert translated["user"] == "test-user"
+
+
 # ---------------------------------------------------------------------------
 # Integration test: post_call_success_hook with model-level guardrails
 # ---------------------------------------------------------------------------
@@ -333,7 +417,7 @@ async def test_post_call_success_hook_runs_model_level_guardrail():
     guardrail = TestGuardrail()
 
     # Mock router that returns a deployment with guardrails configured
-    mock_router = MagicMock()
+    mock_router = route_entry_points_to_stubs(MagicMock())
     mock_deployment = MagicMock()
     mock_deployment.litellm_params.get.return_value = ["test-model-guardrail"]
     mock_router.get_deployment.return_value = mock_deployment
@@ -399,7 +483,7 @@ async def test_post_call_success_hook_skips_guardrail_not_on_model():
     guardrail = TestGuardrail()
 
     # Deployment has a DIFFERENT guardrail configured
-    mock_router = MagicMock()
+    mock_router = route_entry_points_to_stubs(MagicMock())
     mock_deployment = MagicMock()
     mock_deployment.litellm_params.get.return_value = ["some-other-guardrail"]
     mock_router.get_deployment.return_value = mock_deployment
@@ -470,7 +554,7 @@ async def test_streaming_iterator_hook_runs_model_level_guardrail():
 
     guardrail = TestStreamingGuardrail()
 
-    mock_router = MagicMock()
+    mock_router = route_entry_points_to_stubs(MagicMock())
     mock_deployment = MagicMock()
     mock_deployment.litellm_params.get.return_value = ["test-model-guardrail"]
     mock_router.get_deployment.return_value = mock_deployment
@@ -532,7 +616,7 @@ async def test_streaming_iterator_hook_skips_guardrail_not_on_model():
     guardrail = TestStreamingGuardrail()
 
     # Deployment has a DIFFERENT guardrail configured
-    mock_router = MagicMock()
+    mock_router = route_entry_points_to_stubs(MagicMock())
     mock_deployment = MagicMock()
     mock_deployment.litellm_params.get.return_value = ["some-other-guardrail"]
     mock_router.get_deployment.return_value = mock_deployment
@@ -587,7 +671,7 @@ async def test_pre_call_merges_model_level_guardrails_before_pre_call_hook():
     # veria-ai review on PR #29654) and route_request hasn't yet populated
     # model_info.id — so the resolver has to fall back to the model alias
     # and union guardrails across all deployments in the group.
-    mock_router = MagicMock()
+    mock_router = route_entry_points_to_stubs(MagicMock())
     mock_router.get_deployment.return_value = None
     mock_router.get_model_list.return_value = [{"litellm_params": {"guardrails": ["my-pre-call-guardrail"]}}]
 
